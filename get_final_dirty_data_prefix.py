@@ -129,8 +129,8 @@ def main():
     parser.add_argument(
         "-o",
         "--output",
-        default="result.json",
-        help="Output JSON file name (default: result.json)",
+        default="dirty_data_result.json",
+        help="Output JSON file name (default: dirty_data_result.json)",
     )
 
     args = parser.parse_args()
