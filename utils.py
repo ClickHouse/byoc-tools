@@ -6,7 +6,7 @@ import sys
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
-from typing import Set
+from typing import Set, List
 
 
 def create_s3_client(max_workers: int = 50):
@@ -138,6 +138,52 @@ def format_size(size_bytes: int) -> str:
     if size_bytes >= tb:
         return f"{size_bytes / tb:.2f} TB"
     return f"{size_bytes} bytes"
+
+
+def list_all_objects(s3_client, bucket_name: str, prefix: str) -> List[str]:
+    """
+    List all object keys under a given prefix.
+    
+    Args:
+        s3_client: boto3 S3 client
+        bucket_name: Name of the S3 bucket
+        prefix: Prefix to list objects under (e.g., 'ch-s3-000/uuid/')
+    
+    Returns:
+        List of object keys (full paths)
+    """
+    object_keys = []
+    continuation_token = None
+    
+    # Ensure prefix ends with / for proper listing
+    if not prefix.endswith("/"):
+        prefix = prefix + "/"
+    
+    while True:
+        try:
+            params = {"Bucket": bucket_name, "Prefix": prefix}
+            if continuation_token:
+                params["ContinuationToken"] = continuation_token
+            
+            response = s3_client.list_objects_v2(**params)
+            
+            # Collect object keys
+            if "Contents" in response:
+                for obj in response["Contents"]:
+                    object_keys.append(obj["Key"])
+            
+            continuation_token = response.get("NextContinuationToken")
+            if not continuation_token:
+                break
+                
+        except ClientError as e:
+            print(f"Error listing objects under {prefix}: {e}")
+            break
+        except Exception as e:
+            print(f"Unexpected error listing {prefix}: {e}")
+            break
+    
+    return object_keys
 
 
 def print_progress(label: str, current: int, total: int, bar_length: int = 30):

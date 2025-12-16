@@ -4,3 +4,4 @@ result.json
 backup_prefixes.json
 dirty_backup_result.json
 __pycache__/
+non_terminated_prefixes.list
