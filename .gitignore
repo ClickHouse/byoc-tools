@@ -1,0 +1,6 @@
+.venv/
+data_prefixes.json
+result.json
+backup_prefixes.json
+dirty_backup_result.json
+__pycache__/
