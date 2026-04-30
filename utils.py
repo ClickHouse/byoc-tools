@@ -2,11 +2,63 @@
 Common utilities for S3 prefix listing scripts.
 """
 
+import re
 import sys
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 from typing import Set, List
+
+
+# UUID format used in BYOC ch-s3-{uuid} prefixes (8-4-4-4-12 hex digits).
+UUID_PATTERN = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+
+
+def is_valid_uuid(uuid_str: str) -> bool:
+    """
+    Validate if a string matches UUID format (8-4-4-4-12 hex digits).
+    """
+    return bool(UUID_PATTERN.match(uuid_str))
+
+
+def discover_ch_s3_prefixes(s3_client, bucket_name: str) -> List[str]:
+    """
+    Discover all top-level ch-s3-{uuid} prefixes in the bucket.
+
+    Filters out the hex-shard prefixes (ch-s3-{3-hex}) used by user data and
+    returns only full-UUID per-instance prefixes (ch-s3-{8-4-4-4-12}).
+    """
+    ch_s3_prefixes: List[str] = []
+    continuation_token = None
+
+    while True:
+        try:
+            params = {"Bucket": bucket_name, "Prefix": "ch-s3-", "Delimiter": "/"}
+            if continuation_token:
+                params["ContinuationToken"] = continuation_token
+
+            response = s3_client.list_objects_v2(**params)
+
+            for common_prefix in response.get("CommonPrefixes", []):
+                full_prefix = common_prefix["Prefix"].rstrip("/")
+                if not full_prefix.startswith("ch-s3-"):
+                    continue
+                uuid_part = full_prefix[len("ch-s3-") :]
+                if is_valid_uuid(uuid_part):
+                    ch_s3_prefixes.append(full_prefix)
+
+            continuation_token = response.get("NextContinuationToken")
+            if not continuation_token:
+                break
+
+        except Exception as e:
+            print(f"Error discovering ch-s3-* prefixes: {e}")
+            break
+
+    return sorted(ch_s3_prefixes)
 
 
 def create_s3_client(max_workers: int = 50):
