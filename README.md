@@ -89,15 +89,6 @@ to a separate S3 layout from user data:
 
     {bucket}/ch-s3-{KeyPrefix-uuid}/system-tables/mergetree/{server-pod-name}/{table-uuid}/...
 
-The KeyPrefix is per-instance; within an instance, each ClickHouse server pod
-gets its own subdirectory named after the K8s pod (e.g. `c-foo-server-XXX-0`).
-When a pod is replaced (scale up/down, idle/wake, restart), its directory is
-left behind. ClickHouse's automatic cleanup does not delete `query_log` or
-`session_log` directories belonging to retired pods, so this data accumulates.
-
-`list_data_prefixes.py` does NOT cover this layout — it only walks the
-`ch-s3-000` … `ch-s3-fff` hex shards used for user MergeTree data.
-
 ## Get all system-tables prefixes for an account
 
 ```shell
