@@ -2,6 +2,7 @@
 
 * list data prefixes
 * list backup prefixes
+* list system-tables prefixes
 * delete dirty prefixes
 
 # Prerequisites
@@ -79,6 +80,103 @@ the result:
     }
 }
 ```
+
+
+# Get the system-tables prefixes (ClickHouse system logs)
+
+ClickHouse writes system log tables (`query_log`, `metric_log`, `crash_log`, ...)
+to a separate S3 layout from user data:
+
+    {bucket}/ch-s3-{KeyPrefix-uuid}/system-tables/mergetree/{server-pod-name}/{table-uuid}/...
+
+The KeyPrefix is per-instance; within an instance, each ClickHouse server pod
+gets its own subdirectory named after the K8s pod (e.g. `c-foo-server-XXX-0`).
+When a pod is replaced (scale up/down, idle/wake, restart), its directory is
+left behind. ClickHouse's automatic cleanup does not delete `query_log` or
+`session_log` directories belonging to retired pods, so this data accumulates.
+
+`list_data_prefixes.py` does NOT cover this layout — it only walks the
+`ch-s3-000` … `ch-s3-fff` hex shards used for user MergeTree data.
+
+## Get all system-tables prefixes for an account
+
+```shell
+$ python list_system_table_prefixes.py ${data_bucket} -w 100
+```
+
+The result groups per-pod sizes by instance (`ch-s3-{KeyPrefix}` prefix) and
+sums them under a top-level `summary`:
+
+```json
+{
+  "prefixes": [
+    "ch-s3-{KeyPrefix-uuid}/system-tables/mergetree/c-foo-server-AAA-0",
+    ...
+  ],
+  "prefix_sizes_bytes": {
+    "ch-s3-{KeyPrefix-uuid}/system-tables/mergetree/c-foo-server-AAA-0": 5047762890,
+    ...
+  },
+  "by_instances": {
+    "ch-s3-{KeyPrefix-uuid}": {
+      "total_bytes": 56983256576,
+      "total_size_human": "53.08 GB",
+      "replica_count": 25
+    },
+    ...
+  },
+  "summary": {
+    "total_instances": 523,
+    "total_replicas": 1220,
+    "total_size_bytes": 518360551746,
+    "total_size_human": "482.76 GB"
+  }
+}
+```
+
+## Identify terminated-instance orphans
+
+Pass `--context` (repeatable) to cross-reference each `ch-s3-{KeyPrefix}/`
+prefix in S3 against live `ClickHouseCluster` CRDs in those kubectl contexts.
+Each instance entry gains `is_alive`, plus `spoken_name` / `namespace` /
+`context` for the alive ones:
+
+```shell
+$ python list_system_table_prefixes.py ${data_bucket} \
+    --context my-byoc-prod
+```
+
+```json
+{
+  "by_instances": {
+    "ch-s3-{KeyPrefix-uuid}": {
+      "total_size_human": "53.08 GB",
+      "replica_count": 25,
+      "is_alive": true,
+      "spoken_name": "my-prod-instance",
+      "namespace": "ns-my-prod-instance",
+      "context": "my-byoc-prod"
+    },
+    "ch-s3-{terminated-uuid}": {
+      "total_size_human": "1783593 bytes",
+      "replica_count": 1,
+      "is_alive": false
+    }
+  },
+  "summary": {
+    "alive_instance_count": 1,
+    "alive_instance_size_human": "53.08 GB",
+    "dead_instance_count": 1,
+    "dead_instance_size_human": "1783593 bytes"
+  }
+}
+```
+
+> ⚠️ **If multiple BYOC infras share this S3 bucket** (typically because
+> they're in the same AWS account + region), you **must** pass `--context`
+> for **each** of them. Any instance whose context you don't pass will appear
+> as `is_alive: false` (false orphan). For most customers there is only one
+> BYOC infra per AWS account, so a single `--context` is sufficient.
 
 
 # Get the dirty path of the backup
