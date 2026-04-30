@@ -1,83 +1,17 @@
 import argparse
 import concurrent.futures
 import json
-import re
 import time
 from typing import Set, List, Dict, Tuple
 
 from utils import (
     create_s3_client,
+    discover_ch_s3_prefixes,
     list_next_level_prefixes,
     sum_sizes_in_prefix,
     format_size,
     print_progress,
 )
-
-
-def is_valid_uuid(uuid_str: str) -> bool:
-    """
-    Validate if a string matches UUID format (8-4-4-4-12 hex digits).
-    
-    Args:
-        uuid_str: String to validate
-    
-    Returns:
-        True if valid UUID format, False otherwise
-    """
-    uuid_pattern = re.compile(
-        r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE
-    )
-    return bool(uuid_pattern.match(uuid_str))
-
-
-def discover_ch_s3_prefixes(s3_client, bucket_name: str) -> List[str]:
-    """
-    Discover all top-level ch-s3-* prefixes in the bucket.
-    Filters to keep only UUID-format prefixes (ch-s3-uuid where uuid is valid UUID).
-    
-    Args:
-        s3_client: boto3 S3 client
-        bucket_name: Name of the S3 bucket
-    
-    Returns:
-        List of ch-s3-uuid prefixes (validated UUID format)
-    """
-    ch_s3_prefixes = []
-    continuation_token = None
-
-    while True:
-        try:
-            params = {"Bucket": bucket_name, "Prefix": "ch-s3-", "Delimiter": "/"}
-            if continuation_token:
-                params["ContinuationToken"] = continuation_token
-
-            response = s3_client.list_objects_v2(**params)
-
-            # Get common prefixes (top-level ch-s3-* directories)
-            if "CommonPrefixes" in response:
-                for common_prefix in response["CommonPrefixes"]:
-                    full_prefix = common_prefix["Prefix"]
-                    # Remove trailing slash
-                    if full_prefix.endswith("/"):
-                        full_prefix = full_prefix[:-1]
-                    
-                    # Extract UUID part after 'ch-s3-'
-                    if full_prefix.startswith("ch-s3-"):
-                        uuid_part = full_prefix[6:]  # Remove 'ch-s3-' prefix
-                        # Validate UUID format
-                        if is_valid_uuid(uuid_part):
-                            ch_s3_prefixes.append(full_prefix)
-                        # Silently skip non-UUID prefixes
-
-            continuation_token = response.get("NextContinuationToken")
-            if not continuation_token:
-                break
-
-        except Exception as e:
-            print(f"Error discovering ch-s3-* prefixes: {e}")
-            break
-
-    return sorted(ch_s3_prefixes)
 
 
 def list_uuids_under_backup_prefix(
