@@ -13,7 +13,8 @@ This script:
   1. Discovers all ch-s3-{full-uuid}/ prefixes at the bucket root
   2. For each, lists system-tables/mergetree/{pod-name}/ subdirectories
   3. Sums bytes per (instance, pod) pair
-  4. Optionally cross-references each KeyPrefix against ClickHouseCluster
+  4. Groups per-pod sizes by spoken name, derived from c-...-server-...
+  5. Optionally cross-references each KeyPrefix against ClickHouseCluster
      CRDs from one or more kubectl contexts (--context, repeatable) and
      annotates each instance with is_alive / spoken_name / namespace —
      useful for distinguishing data still in use from terminated-instance
@@ -43,6 +44,61 @@ from utils import (
 
 
 SYSTEM_TABLES_SUBPATH = "system-tables/mergetree"
+SYSTEM_TABLES_POD_MARKER = f"/system-tables/mergetree/c-"
+SERVER_MARKER = "-server-"
+
+
+def extract_spoken_name_from_path(path: str) -> str:
+    """Extract spoken name from a system-tables pod path."""
+    if SYSTEM_TABLES_POD_MARKER not in path:
+        raise ValueError(f"missing {SYSTEM_TABLES_POD_MARKER!r}")
+
+    pod_name = path.split(SYSTEM_TABLES_POD_MARKER, 1)[1]
+    if SERVER_MARKER not in pod_name:
+        raise ValueError(f"missing {SERVER_MARKER!r}")
+
+    spoken_name = pod_name.split(SERVER_MARKER, 1)[0]
+    if not spoken_name:
+        raise ValueError("empty spoken name")
+
+    return spoken_name
+
+
+def build_spoken_name_breakdown(
+    prefix_to_size: Dict[str, int],
+) -> Tuple[Dict[str, Dict], int]:
+    """
+    Group per-pod sizes by spoken name.
+
+    Output order is descending by total size, with spoken name as a stable
+    tie-breaker.
+    """
+    totals: Dict[str, int] = {}
+    counts: Dict[str, int] = {}
+    skipped = 0
+
+    for path, size in prefix_to_size.items():
+        try:
+            spoken_name = extract_spoken_name_from_path(path)
+        except ValueError as exc:
+            skipped += 1
+            sys.stderr.write(f"warning: skipping {path!r}: {exc}\n")
+            continue
+
+        totals[spoken_name] = totals.get(spoken_name, 0) + size
+        counts[spoken_name] = counts.get(spoken_name, 0) + 1
+
+    return (
+        {
+            spoken_name: {
+                "total_bytes": totals[spoken_name],
+                "total_size_human": format_size(totals[spoken_name]),
+                "prefix_count": counts[spoken_name],
+            }
+            for spoken_name in sorted(totals, key=lambda name: (-totals[name], name))
+        },
+        skipped,
+    )
 
 
 def fetch_instance_index(contexts: List[str]) -> Dict[str, Dict[str, str]]:
@@ -228,9 +284,14 @@ def collect_system_table_prefixes(
 
         by_instances[prefix] = entry
 
+    by_spoken_name, skipped_spoken_name_prefixes = build_spoken_name_breakdown(
+        prefix_to_size
+    )
+
     total_bytes = sum(prefix_to_size.values())
     summary: Dict = {
         "total_instances": len(by_instances),
+        "total_spoken_names": len(by_spoken_name),
         "total_replicas": len(full_paths),
         "total_size_bytes": total_bytes,
         "total_size_human": format_size(total_bytes),
@@ -251,6 +312,7 @@ def collect_system_table_prefixes(
         "prefixes": full_paths,
         "prefix_sizes_bytes": prefix_to_size,
         "by_instances": by_instances,
+        "by_spoken_name": by_spoken_name,
         "summary": summary,
     }
 
@@ -261,6 +323,7 @@ def collect_system_table_prefixes(
 
     print("\nSummary:")
     print(f"  Instances with system-tables: {summary['total_instances']}")
+    print(f"  Spoken names with system-tables: {summary['total_spoken_names']}")
     print(f"  Total replica subdirectories: {summary['total_replicas']}")
     print(
         f"  Total size: {total_bytes} bytes ({summary['total_size_human']})"
