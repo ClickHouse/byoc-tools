@@ -43,6 +43,7 @@ from utils import (
 )
 
 
+SYSTEM_TABLES_SUBPATH = "system-tables/mergetree"
 SYSTEM_TABLES_POD_MARKER = f"/system-tables/mergetree/c-"
 SERVER_MARKER = "-server-"
 
