@@ -4,7 +4,7 @@ List system-tables prefixes in a BYOC cloud-shared bucket.
 ClickHouse writes system log tables (query_log, metric_log, crash_log, ...) to
 a separate S3 layout from user data:
 
-    {bucket}/ch-s3-{KeyPrefix-uuid}/system-tables/mergetree/{server-pod-name}/{table-uuid}/...
+    {bucket}/ch-s3-{KeyPrefix-uuid}/system-tables/mergetree/{server-pod-name}/store/{3-hex}/{table-uuid}/...
 
 The KeyPrefix is per-instance. Each ClickHouse server pod gets its own
 subdirectory inside.
@@ -12,7 +12,7 @@ subdirectory inside.
 This script:
   1. Discovers all ch-s3-{full-uuid}/ prefixes at the bucket root
   2. For each, lists system-tables/mergetree/{pod-name}/ subdirectories
-  3. Sums bytes per (instance, pod) pair
+  3. Sums bytes and counts table UUIDs per (instance, pod) pair
   4. Groups per-pod sizes by spoken name, derived from c-...-server-...
   5. Optionally cross-references each KeyPrefix against ClickHouseCluster
      CRDs from one or more kubectl contexts (--context, repeatable) and
@@ -28,16 +28,16 @@ is for user data. system-tables uses an entirely different prefix scheme.
 import argparse
 import concurrent.futures
 import json
+import re
 import subprocess
 import sys
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from utils import (
     create_s3_client,
     discover_ch_s3_prefixes,
     list_next_level_prefixes,
-    sum_sizes_in_prefix,
     format_size,
     print_progress,
 )
@@ -46,6 +46,12 @@ from utils import (
 SYSTEM_TABLES_SUBPATH = "system-tables/mergetree"
 SYSTEM_TABLES_POD_MARKER = f"/system-tables/mergetree/c-"
 SERVER_MARKER = "-server-"
+TABLE_UUID_IN_STORE_PATTERN = re.compile(
+    r"/store/[0-9a-f]{3}/"
+    r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
+    r"(?:/|$)",
+    re.IGNORECASE,
+)
 
 
 def extract_spoken_name_from_path(path: str) -> str:
@@ -166,6 +172,60 @@ def list_pods_under_instance(
     return sorted(list_next_level_prefixes(s3_client, bucket_name, full_prefix))
 
 
+def extract_table_uuid_from_key(key: str) -> Optional[str]:
+    """Extract a table UUID from .../store/{3-hex}/{uuid}/... object keys."""
+    match = TABLE_UUID_IN_STORE_PATTERN.search(key)
+    if not match:
+        return None
+    return match.group(1).lower()
+
+
+def extract_table_uuid_prefix_from_key(key: str) -> Optional[str]:
+    """Extract a prefix ending at .../store/{3-hex}/{uuid} from an object key."""
+    match = TABLE_UUID_IN_STORE_PATTERN.search(key)
+    if not match:
+        return None
+    return key[: match.end(1)]
+
+
+def sum_size_and_table_uuid_prefixes(
+    s3_client, bucket_name: str, prefix: str
+) -> Tuple[int, int, List[str]]:
+    """Sum bytes and collect unique table UUID prefixes under one pod prefix."""
+    total_size = 0
+    table_uuids: Set[str] = set()
+    table_uuid_prefixes: Set[str] = set()
+    continuation_token = None
+
+    while True:
+        try:
+            params = {"Bucket": bucket_name, "Prefix": prefix}
+            if continuation_token:
+                params["ContinuationToken"] = continuation_token
+
+            response = s3_client.list_objects_v2(**params)
+
+            for obj in response.get("Contents", []):
+                total_size += obj.get("Size", 0)
+                key = obj.get("Key", "")
+                table_uuid = extract_table_uuid_from_key(key)
+                if table_uuid:
+                    table_uuids.add(table_uuid)
+                table_uuid_prefix = extract_table_uuid_prefix_from_key(key)
+                if table_uuid_prefix:
+                    table_uuid_prefixes.add(table_uuid_prefix)
+
+            continuation_token = response.get("NextContinuationToken")
+            if not continuation_token:
+                break
+
+        except Exception as exc:
+            print(f"Unexpected error counting {prefix}: {exc}")
+            break
+
+    return total_size, len(table_uuids), sorted(table_uuid_prefixes)
+
+
 def collect_system_table_prefixes(
     bucket_name: str,
     output_file: str,
@@ -227,26 +287,44 @@ def collect_system_table_prefixes(
             full_paths.append(f"{prefix}/{SYSTEM_TABLES_SUBPATH}/{pod}")
     full_paths.sort()
 
-    # Phase 2: sum bytes for each pod path.
-    print(f"\nSumming object sizes under {len(full_paths)} pod path(s)...")
+    # Phase 2: sum bytes and count table UUIDs for each pod path.
+    print(
+        f"\nSumming object sizes and counting table UUIDs under "
+        f"{len(full_paths)} pod path(s)..."
+    )
     prefix_to_size: Dict[str, int] = {}
+    prefix_to_table_uuid_count: Dict[str, int] = {}
+    prefix_to_table_uuid_prefixes: Dict[str, List[str]] = {}
 
-    def size_for_path(path: str) -> Tuple[str, int]:
+    def size_and_uuid_prefixes_for_path(
+        path: str,
+    ) -> Tuple[str, int, int, List[str]]:
         try:
-            return path, sum_sizes_in_prefix(s3_client, bucket_name, f"{path}/")
+            (
+                size,
+                table_uuid_count,
+                table_uuid_prefixes,
+            ) = sum_size_and_table_uuid_prefixes(
+                s3_client, bucket_name, f"{path}/"
+            )
+            return path, size, table_uuid_count, table_uuid_prefixes
         except Exception as exc:
             print(f"Error counting {path}: {exc}")
-            return path, 0
+            return path, 0, 0, []
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(size_for_path, p): p for p in full_paths}
+        futures = {
+            executor.submit(size_and_uuid_prefixes_for_path, p): p for p in full_paths
+        }
         completed = 0
         total = len(full_paths)
         for future in concurrent.futures.as_completed(futures):
-            path, size = future.result()
+            path, size, table_uuid_count, table_uuid_prefixes = future.result()
             prefix_to_size[path] = size
+            prefix_to_table_uuid_prefixes[path] = table_uuid_prefixes
+            prefix_to_table_uuid_count[path] = table_uuid_count
             completed += 1
-            print_progress("Counting sizes", completed, total)
+            print_progress("Counting sizes/table UUIDs", completed, total)
 
     # Phase 3: per-instance grouping + optional alive/dead annotation from
     # the kubectl-derived instance index.
@@ -261,11 +339,18 @@ def collect_system_table_prefixes(
             prefix_to_size.get(f"{prefix}/{SYSTEM_TABLES_SUBPATH}/{pod}", 0)
             for pod in pods
         )
+        instance_table_uuid_count = sum(
+            prefix_to_table_uuid_count.get(
+                f"{prefix}/{SYSTEM_TABLES_SUBPATH}/{pod}", 0
+            )
+            for pod in pods
+        )
 
         entry: Dict = {
             "total_bytes": instance_total,
             "total_size_human": format_size(instance_total),
             "replica_count": len(pods),
+            "table_uuid_count_across_pods": instance_table_uuid_count,
         }
 
         if instance_index is not None:
@@ -289,10 +374,18 @@ def collect_system_table_prefixes(
     )
 
     total_bytes = sum(prefix_to_size.values())
+    total_table_uuid_count = sum(prefix_to_table_uuid_count.values())
+    table_uuid_prefixes = sorted(
+        table_uuid_prefix
+        for prefixes in prefix_to_table_uuid_prefixes.values()
+        for table_uuid_prefix in prefixes
+    )
     summary: Dict = {
         "total_instances": len(by_instances),
         "total_spoken_names": len(by_spoken_name),
         "total_replicas": len(full_paths),
+        "total_table_uuid_count_across_pod_paths": total_table_uuid_count,
+        "total_table_uuid_prefixes": len(table_uuid_prefixes),
         "total_size_bytes": total_bytes,
         "total_size_human": format_size(total_bytes),
     }
@@ -310,7 +403,10 @@ def collect_system_table_prefixes(
 
     output_data = {
         "prefixes": full_paths,
+        "table_uuid_prefixes": table_uuid_prefixes,
         "prefix_sizes_bytes": prefix_to_size,
+        "prefix_table_uuid_counts": prefix_to_table_uuid_count,
+        "prefix_table_uuid_prefixes": prefix_to_table_uuid_prefixes,
         "by_instances": by_instances,
         "by_spoken_name": by_spoken_name,
         "summary": summary,
@@ -325,6 +421,11 @@ def collect_system_table_prefixes(
     print(f"  Instances with system-tables: {summary['total_instances']}")
     print(f"  Spoken names with system-tables: {summary['total_spoken_names']}")
     print(f"  Total replica subdirectories: {summary['total_replicas']}")
+    print(
+        "  Total table UUIDs across pod paths: "
+        f"{summary['total_table_uuid_count_across_pod_paths']}"
+    )
+    print(f"  Total table UUID prefixes: {summary['total_table_uuid_prefixes']}")
     print(
         f"  Total size: {total_bytes} bytes ({summary['total_size_human']})"
     )
