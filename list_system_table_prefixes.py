@@ -9,8 +9,15 @@ a separate S3 layout from user data:
 The KeyPrefix is per-instance. Each ClickHouse server pod gets its own
 subdirectory inside.
 
+Input can be either a whole bucket or a single instance prefix:
+
+    {bucket}
+    {bucket}/ch-s3-{KeyPrefix-uuid}
+    s3://{bucket}/ch-s3-{KeyPrefix-uuid}
+
 This script:
-  1. Discovers all ch-s3-{full-uuid}/ prefixes at the bucket root
+  1. Discovers all ch-s3-{full-uuid}/ prefixes at the bucket root, unless a
+     single ch-s3-{full-uuid} prefix is provided
   2. For each, lists system-tables/mergetree/{pod-name}/ subdirectories
   3. Sums bytes and counts table UUIDs per (instance, pod) pair
   4. Groups per-pod sizes by spoken name, derived from c-...-server-...
@@ -37,6 +44,7 @@ from typing import Dict, List, Optional, Set, Tuple
 from utils import (
     create_s3_client,
     discover_ch_s3_prefixes,
+    is_valid_uuid,
     list_next_level_prefixes,
     format_size,
     print_progress,
@@ -52,6 +60,46 @@ TABLE_UUID_IN_STORE_PATTERN = re.compile(
     r"(?:/|$)",
     re.IGNORECASE,
 )
+
+
+def parse_s3_scan_target(s3_target: str) -> Tuple[str, Optional[str]]:
+    """
+    Parse CLI input into (bucket_name, optional ch-s3-{uuid} instance prefix).
+
+    Accepted forms:
+      - bucket-name
+      - bucket-name/ch-s3-{uuid}
+      - s3://bucket-name/ch-s3-{uuid}
+
+    If a deeper object/prefix path is pasted, the first ch-s3-{uuid} component
+    is used as the instance prefix.
+    """
+    target = s3_target.strip()
+    if target.startswith("s3://"):
+        target = target[len("s3://") :]
+    target = target.strip("/")
+    if not target:
+        raise ValueError("S3 target must be a bucket or bucket/ch-s3-{uuid}")
+
+    parts = [part for part in target.split("/") if part]
+    bucket_name = parts[0]
+    if len(parts) == 1:
+        return bucket_name, None
+
+    for part in parts[1:]:
+        if not part.startswith("ch-s3-"):
+            continue
+        uuid_part = part[len("ch-s3-") :]
+        if is_valid_uuid(uuid_part):
+            return bucket_name, part
+        raise ValueError(
+            f"{part!r} is not a full ch-s3 UUID prefix; expected ch-s3-{{uuid}}"
+        )
+
+    raise ValueError(
+        "S3 target with a prefix must include ch-s3-{uuid}; "
+        "expected bucket or bucket/ch-s3-{uuid}"
+    )
 
 
 def extract_spoken_name_from_path(path: str) -> str:
@@ -231,6 +279,7 @@ def collect_system_table_prefixes(
     output_file: str,
     contexts: Optional[List[str]],
     max_workers: int,
+    instance_prefix: Optional[str] = None,
 ):
     print(f"Using {max_workers} concurrent workers")
 
@@ -246,9 +295,16 @@ def collect_system_table_prefixes(
 
     start_time = time.perf_counter()
 
-    print("Discovering ch-s3-{uuid}/ prefixes...")
-    instance_prefixes = discover_ch_s3_prefixes(s3_client, bucket_name)
-    print(f"Found {len(instance_prefixes)} ch-s3-{{uuid}}/ prefix(es)")
+    if instance_prefix:
+        print(
+            f"Scanning only instance prefix {instance_prefix!r} "
+            f"in bucket {bucket_name!r}"
+        )
+        instance_prefixes = [instance_prefix]
+    else:
+        print("Discovering ch-s3-{uuid}/ prefixes...")
+        instance_prefixes = discover_ch_s3_prefixes(s3_client, bucket_name)
+        print(f"Found {len(instance_prefixes)} ch-s3-{{uuid}}/ prefix(es)")
 
     if not instance_prefixes:
         print("Nothing to scan. Exiting.")
@@ -456,12 +512,18 @@ def main():
     parser = argparse.ArgumentParser(
         description=(
             "List system-tables prefixes (per ClickHouse server pod) in a "
-            "BYOC cloud-shared bucket. Optionally cross-reference each "
-            "KeyPrefix against live ClickHouseCluster CRDs to flag "
-            "terminated-instance orphans."
+            "BYOC cloud-shared bucket or under one ch-s3 UUID prefix. "
+            "Optionally cross-reference each KeyPrefix against live "
+            "ClickHouseCluster CRDs to flag terminated-instance orphans."
         )
     )
-    parser.add_argument("bucket_name", help="Name of the cloud-shared S3 bucket")
+    parser.add_argument(
+        "s3_target",
+        help=(
+            "Cloud-shared S3 bucket, or bucket/ch-s3-{uuid}; "
+            "s3://bucket/ch-s3-{uuid} is also accepted"
+        ),
+    )
     parser.add_argument(
         "-o",
         "--output",
@@ -491,11 +553,17 @@ def main():
     )
 
     args = parser.parse_args()
+    try:
+        bucket_name, instance_prefix = parse_s3_scan_target(args.s3_target)
+    except ValueError as exc:
+        parser.error(str(exc))
+
     collect_system_table_prefixes(
-        args.bucket_name,
+        bucket_name,
         args.output,
         args.contexts,
         args.workers,
+        instance_prefix,
     )
 
 
