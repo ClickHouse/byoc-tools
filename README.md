@@ -78,10 +78,15 @@ the result:
       "ch-s3-000/09ae9cf0-31a7-4af6-8431-c553a290f097": 5338,
       ...
     },
+    "dirty_paths_latest_object_timestamps": {
+      "ch-s3-000/09ae9cf0-31a7-4af6-8431-c553a290f097": "2026-07-15T09:57:00Z",
+      ...
+    },
     "summary": {
       "total_dirty_paths": 82892,
       "total_dirty_size_bytes": 123806743839,
-      "total_dirty_size_human": "115.30 GB"
+      "total_dirty_size_human": "115.30 GB",
+      "latest_dirty_object_timestamp": "2026-07-15T09:57:00Z"
     }
 }
 ```
@@ -270,10 +275,14 @@ the result:
   "dirty_paths_sizes_bytes": {
     "ch-s3-03238e68-e7d3-443b-a088-b850943dfb5b/4e33a077-8509-44e1-a878-4d2f7d9a5244": 191019308,
   },
+  "dirty_paths_latest_object_timestamps": {
+    "ch-s3-03238e68-e7d3-443b-a088-b850943dfb5b/4e33a077-8509-44e1-a878-4d2f7d9a5244": "2026-07-15T09:57:00Z",
+  },
   "summary": {
     "total_dirty_paths": 183,
     "total_dirty_size_bytes": 25620595561,
-    "total_dirty_size_human": "23.86 GB"
+    "total_dirty_size_human": "23.86 GB",
+    "latest_dirty_object_timestamp": "2026-07-15T09:57:00Z"
   }
 }
 ```
