@@ -2,14 +2,16 @@ import argparse
 import concurrent.futures
 import json
 import time
-from typing import Set, List, Dict, Tuple
+from datetime import datetime
+from typing import Optional, Set, List, Dict, Tuple
 
 from utils import (
     create_s3_client,
     discover_ch_s3_prefixes,
     list_next_level_prefixes,
-    sum_sizes_in_prefix,
+    sum_prefix_stats,
     format_size,
+    format_timestamp,
     print_progress,
 )
 
@@ -64,6 +66,8 @@ def collect_all_backup_prefixes(
     ch_s3_to_uuids: Dict[str, List[str]] = {}
     # Dictionary to store prefix -> total size mapping (bytes)
     prefix_to_size: Dict[str, int] = {}
+    # Dictionary to store prefix -> newest object LastModified mapping
+    prefix_to_latest: Dict[str, Optional[datetime]] = {}
     all_uuids = set()
 
     # Phase 2: For each ch-s3-uuid, list all UUIDs underneath
@@ -106,40 +110,52 @@ def collect_all_backup_prefixes(
     # Sort for consistent output
     sorted_full_paths = sorted(all_full_paths)
 
-    # Phase 3: Calculate sizes for each prefix concurrently
+    # Phase 3: Calculate sizes and newest object timestamps for each prefix concurrently
     print("\nCounting objects in each prefix...")
 
-    def size_for_prefix(full_path: str) -> Tuple[str, int]:
+    def stats_for_prefix(full_path: str) -> Tuple[str, int, Optional[datetime]]:
         try:
-            total_size = sum_sizes_in_prefix(s3_client, bucket_name, f"{full_path}/")
-            return (full_path, total_size)
+            total_size, latest_modified = sum_prefix_stats(
+                s3_client, bucket_name, f"{full_path}/"
+            )
+            return (full_path, total_size, latest_modified)
         except Exception as e:
             print(f"Error counting objects for {full_path}: {e}")
-            return (full_path, 0)
+            return (full_path, 0, None)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         size_futures = {
-            executor.submit(size_for_prefix, path): path for path in sorted_full_paths
+            executor.submit(stats_for_prefix, path): path for path in sorted_full_paths
         }
 
         completed_count = 0
         total_sizes = len(sorted_full_paths)
         for future in concurrent.futures.as_completed(size_futures):
-            full_path, total_size = future.result()
+            full_path, total_size, latest_modified = future.result()
             prefix_to_size[full_path] = total_size
+            prefix_to_latest[full_path] = latest_modified
             completed_count += 1
             print_progress("Counting sizes", completed_count, total_sizes)
+
+    overall_latest = max(
+        (ts for ts in prefix_to_latest.values() if ts is not None), default=None
+    )
 
     # Prepare output data with counts
     output_data = {
         "prefixes": sorted_full_paths,
         "prefix_sizes_bytes": prefix_to_size,
+        "prefix_latest_object_timestamps": {
+            path: format_timestamp(prefix_to_latest.get(path))
+            for path in sorted_full_paths
+        },
         "summary": {
             "total_unique_uuids": len(all_uuids),
             "total_ch_s3_prefixes": len(ch_s3_prefixes),
             "total_full_paths": len(sorted_full_paths),
             "total_size_bytes": sum(prefix_to_size.values()),
             "total_size_human": format_size(sum(prefix_to_size.values())),
+            "latest_object_timestamp": format_timestamp(overall_latest),
         },
     }
 

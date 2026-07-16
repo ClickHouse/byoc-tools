@@ -19,7 +19,8 @@ This script:
   1. Discovers all ch-s3-{full-uuid}/ prefixes at the bucket root, unless a
      single ch-s3-{full-uuid} prefix is provided
   2. For each, lists system-tables/mergetree/{pod-name}/ subdirectories
-  3. Sums bytes and counts table UUIDs per (instance, pod) pair
+  3. Sums bytes, tracks the newest object timestamp, and counts table UUIDs
+     per (instance, pod) pair — plus per table-UUID prefix
   4. Groups per-pod sizes by spoken name, derived from c-...-server-...
   5. Optionally cross-references each KeyPrefix against ClickHouseCluster
      CRDs from one or more kubectl contexts (--context, repeatable) and
@@ -39,6 +40,7 @@ import re
 import subprocess
 import sys
 import time
+from datetime import datetime
 from typing import Dict, List, Optional, Set, Tuple
 
 from utils import (
@@ -47,6 +49,7 @@ from utils import (
     is_valid_uuid,
     list_next_level_prefixes,
     format_size,
+    format_timestamp,
     print_progress,
 )
 
@@ -120,15 +123,17 @@ def extract_spoken_name_from_path(path: str) -> str:
 
 def build_spoken_name_breakdown(
     prefix_to_size: Dict[str, int],
+    prefix_to_latest: Dict[str, Optional[datetime]],
 ) -> Tuple[Dict[str, Dict], int]:
     """
-    Group per-pod sizes by spoken name.
+    Group per-pod sizes and newest object timestamps by spoken name.
 
     Output order is descending by total size, with spoken name as a stable
     tie-breaker.
     """
     totals: Dict[str, int] = {}
     counts: Dict[str, int] = {}
+    latests: Dict[str, Optional[datetime]] = {}
     skipped = 0
 
     for path, size in prefix_to_size.items():
@@ -141,6 +146,11 @@ def build_spoken_name_breakdown(
 
         totals[spoken_name] = totals.get(spoken_name, 0) + size
         counts[spoken_name] = counts.get(spoken_name, 0) + 1
+        latest = prefix_to_latest.get(path)
+        if latest and (
+            latests.get(spoken_name) is None or latest > latests[spoken_name]
+        ):
+            latests[spoken_name] = latest
 
     return (
         {
@@ -148,6 +158,9 @@ def build_spoken_name_breakdown(
                 "total_bytes": totals[spoken_name],
                 "total_size_human": format_size(totals[spoken_name]),
                 "prefix_count": counts[spoken_name],
+                "latest_object_timestamp": format_timestamp(
+                    latests.get(spoken_name)
+                ),
             }
             for spoken_name in sorted(totals, key=lambda name: (-totals[name], name))
         },
@@ -238,11 +251,16 @@ def extract_table_uuid_prefix_from_key(key: str) -> Optional[str]:
 
 def sum_size_and_table_uuid_prefixes(
     s3_client, bucket_name: str, prefix: str
-) -> Tuple[int, int, List[str]]:
-    """Sum bytes and collect unique table UUID prefixes under one pod prefix."""
+) -> Tuple[int, Optional[datetime], int, Dict[str, Dict]]:
+    """
+    Sum bytes, track the newest object LastModified, and aggregate per
+    table-UUID-prefix stats (size + newest LastModified) under one pod prefix.
+    """
     total_size = 0
+    latest_modified: Optional[datetime] = None
     table_uuids: Set[str] = set()
-    table_uuid_prefixes: Set[str] = set()
+    # table UUID prefix -> {"size_bytes": int, "latest": Optional[datetime]}
+    table_uuid_prefix_stats: Dict[str, Dict] = {}
     continuation_token = None
 
     while True:
@@ -254,14 +272,28 @@ def sum_size_and_table_uuid_prefixes(
             response = s3_client.list_objects_v2(**params)
 
             for obj in response.get("Contents", []):
-                total_size += obj.get("Size", 0)
+                size = obj.get("Size", 0)
+                last_modified = obj.get("LastModified")
+                total_size += size
+                if last_modified and (
+                    latest_modified is None or last_modified > latest_modified
+                ):
+                    latest_modified = last_modified
+
                 key = obj.get("Key", "")
                 table_uuid = extract_table_uuid_from_key(key)
                 if table_uuid:
                     table_uuids.add(table_uuid)
                 table_uuid_prefix = extract_table_uuid_prefix_from_key(key)
                 if table_uuid_prefix:
-                    table_uuid_prefixes.add(table_uuid_prefix)
+                    stats = table_uuid_prefix_stats.setdefault(
+                        table_uuid_prefix, {"size_bytes": 0, "latest": None}
+                    )
+                    stats["size_bytes"] += size
+                    if last_modified and (
+                        stats["latest"] is None or last_modified > stats["latest"]
+                    ):
+                        stats["latest"] = last_modified
 
             continuation_token = response.get("NextContinuationToken")
             if not continuation_token:
@@ -271,7 +303,7 @@ def sum_size_and_table_uuid_prefixes(
             print(f"Unexpected error counting {prefix}: {exc}")
             break
 
-    return total_size, len(table_uuids), sorted(table_uuid_prefixes)
+    return total_size, latest_modified, len(table_uuids), table_uuid_prefix_stats
 
 
 def collect_system_table_prefixes(
@@ -343,30 +375,35 @@ def collect_system_table_prefixes(
             full_paths.append(f"{prefix}/{SYSTEM_TABLES_SUBPATH}/{pod}")
     full_paths.sort()
 
-    # Phase 2: sum bytes and count table UUIDs for each pod path.
+    # Phase 2: sum bytes, track newest object timestamps, and count table
+    # UUIDs for each pod path.
     print(
         f"\nSumming object sizes and counting table UUIDs under "
         f"{len(full_paths)} pod path(s)..."
     )
     prefix_to_size: Dict[str, int] = {}
+    prefix_to_latest: Dict[str, Optional[datetime]] = {}
     prefix_to_table_uuid_count: Dict[str, int] = {}
     prefix_to_table_uuid_prefixes: Dict[str, List[str]] = {}
+    # table UUID prefix -> {"size_bytes": int, "latest": Optional[datetime]}
+    table_uuid_prefix_stats: Dict[str, Dict] = {}
 
     def size_and_uuid_prefixes_for_path(
         path: str,
-    ) -> Tuple[str, int, int, List[str]]:
+    ) -> Tuple[str, int, Optional[datetime], int, Dict[str, Dict]]:
         try:
             (
                 size,
+                latest_modified,
                 table_uuid_count,
-                table_uuid_prefixes,
+                uuid_prefix_stats,
             ) = sum_size_and_table_uuid_prefixes(
                 s3_client, bucket_name, f"{path}/"
             )
-            return path, size, table_uuid_count, table_uuid_prefixes
+            return path, size, latest_modified, table_uuid_count, uuid_prefix_stats
         except Exception as exc:
             print(f"Error counting {path}: {exc}")
-            return path, 0, 0, []
+            return path, 0, None, 0, {}
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
@@ -375,10 +412,18 @@ def collect_system_table_prefixes(
         completed = 0
         total = len(full_paths)
         for future in concurrent.futures.as_completed(futures):
-            path, size, table_uuid_count, table_uuid_prefixes = future.result()
+            (
+                path,
+                size,
+                latest_modified,
+                table_uuid_count,
+                uuid_prefix_stats,
+            ) = future.result()
             prefix_to_size[path] = size
-            prefix_to_table_uuid_prefixes[path] = table_uuid_prefixes
+            prefix_to_latest[path] = latest_modified
+            prefix_to_table_uuid_prefixes[path] = sorted(uuid_prefix_stats)
             prefix_to_table_uuid_count[path] = table_uuid_count
+            table_uuid_prefix_stats.update(uuid_prefix_stats)
             completed += 1
             print_progress("Counting sizes/table UUIDs", completed, total)
 
@@ -401,12 +446,20 @@ def collect_system_table_prefixes(
             )
             for pod in pods
         )
+        pod_latests = [
+            prefix_to_latest.get(f"{prefix}/{SYSTEM_TABLES_SUBPATH}/{pod}")
+            for pod in pods
+        ]
+        instance_latest = max(
+            (ts for ts in pod_latests if ts is not None), default=None
+        )
 
         entry: Dict = {
             "total_bytes": instance_total,
             "total_size_human": format_size(instance_total),
             "replica_count": len(pods),
             "table_uuid_count_across_pods": instance_table_uuid_count,
+            "latest_object_timestamp": format_timestamp(instance_latest),
         }
 
         if instance_index is not None:
@@ -426,15 +479,14 @@ def collect_system_table_prefixes(
         by_instances[prefix] = entry
 
     by_spoken_name, skipped_spoken_name_prefixes = build_spoken_name_breakdown(
-        prefix_to_size
+        prefix_to_size, prefix_to_latest
     )
 
     total_bytes = sum(prefix_to_size.values())
     total_table_uuid_count = sum(prefix_to_table_uuid_count.values())
-    table_uuid_prefixes = sorted(
-        table_uuid_prefix
-        for prefixes in prefix_to_table_uuid_prefixes.values()
-        for table_uuid_prefix in prefixes
+    table_uuid_prefixes = sorted(table_uuid_prefix_stats)
+    overall_latest = max(
+        (ts for ts in prefix_to_latest.values() if ts is not None), default=None
     )
     summary: Dict = {
         "total_instances": len(by_instances),
@@ -444,6 +496,7 @@ def collect_system_table_prefixes(
         "total_table_uuid_prefixes": len(table_uuid_prefixes),
         "total_size_bytes": total_bytes,
         "total_size_human": format_size(total_bytes),
+        "latest_object_timestamp": format_timestamp(overall_latest),
     }
     if instance_index is not None:
         summary.update(
@@ -461,8 +514,21 @@ def collect_system_table_prefixes(
         "prefixes": full_paths,
         "table_uuid_prefixes": table_uuid_prefixes,
         "prefix_sizes_bytes": prefix_to_size,
+        "prefix_latest_object_timestamps": {
+            path: format_timestamp(prefix_to_latest.get(path)) for path in full_paths
+        },
         "prefix_table_uuid_counts": prefix_to_table_uuid_count,
         "prefix_table_uuid_prefixes": prefix_to_table_uuid_prefixes,
+        "table_uuid_prefix_sizes_bytes": {
+            table_uuid_prefix: table_uuid_prefix_stats[table_uuid_prefix]["size_bytes"]
+            for table_uuid_prefix in table_uuid_prefixes
+        },
+        "table_uuid_prefix_latest_object_timestamps": {
+            table_uuid_prefix: format_timestamp(
+                table_uuid_prefix_stats[table_uuid_prefix]["latest"]
+            )
+            for table_uuid_prefix in table_uuid_prefixes
+        },
         "by_instances": by_instances,
         "by_spoken_name": by_spoken_name,
         "summary": summary,
