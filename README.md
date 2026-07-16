@@ -39,12 +39,17 @@ the result:
         "ch-s3-000/09ae9cf0-31a7-4af6-8431-c553a290f097": 4324,
         ...
     },
+    "prefix_latest_object_timestamps": {
+        "ch-s3-000/09ae9cf0-31a7-4af6-8431-c553a290f097": "2026-07-15T09:57:00Z",
+        ...
+    },
     "summary": {
         "total_unique_prefixes": 12345,
         "total_uuids_with_prefixes": 4096,
         "total_full_paths": 82892,
         "total_size_bytes": 123806743839,
-        "total_size_human": "115.30 GB"
+        "total_size_human": "115.30 GB",
+        "latest_object_timestamp": "2026-07-15T09:57:00Z"
     }
 }
 ```
@@ -104,15 +109,41 @@ sums them under a top-level `summary`:
     "ch-s3-{KeyPrefix-uuid}/system-tables/mergetree/c-foo-server-AAA-0",
     ...
   ],
+  "table_uuid_prefixes": [
+    "ch-s3-{KeyPrefix-uuid}/system-tables/mergetree/c-foo-server-AAA-0/store/abc/{table-uuid}",
+    ...
+  ],
   "prefix_sizes_bytes": {
     "ch-s3-{KeyPrefix-uuid}/system-tables/mergetree/c-foo-server-AAA-0": 5047762890,
+    ...
+  },
+  "prefix_latest_object_timestamps": {
+    "ch-s3-{KeyPrefix-uuid}/system-tables/mergetree/c-foo-server-AAA-0": "2026-07-15T09:57:00Z",
+    ...
+  },
+  "table_uuid_prefix_sizes_bytes": {
+    "ch-s3-{KeyPrefix-uuid}/system-tables/mergetree/c-foo-server-AAA-0/store/abc/{table-uuid}": 5040000000,
+    ...
+  },
+  "table_uuid_prefix_latest_object_timestamps": {
+    "ch-s3-{KeyPrefix-uuid}/system-tables/mergetree/c-foo-server-AAA-0/store/abc/{table-uuid}": "2026-07-15T09:57:00Z",
     ...
   },
   "by_instances": {
     "ch-s3-{KeyPrefix-uuid}": {
       "total_bytes": 56983256576,
       "total_size_human": "53.08 GB",
-      "replica_count": 25
+      "replica_count": 25,
+      "latest_object_timestamp": "2026-07-15T09:57:00Z"
+    },
+    ...
+  },
+  "by_spoken_name": {
+    "foo": {
+      "total_bytes": 56983256576,
+      "total_size_human": "53.08 GB",
+      "prefix_count": 25,
+      "latest_object_timestamp": "2026-07-15T09:57:00Z"
     },
     ...
   },
@@ -120,10 +151,15 @@ sums them under a top-level `summary`:
     "total_instances": 523,
     "total_replicas": 1220,
     "total_size_bytes": 518360551746,
-    "total_size_human": "482.76 GB"
+    "total_size_human": "482.76 GB",
+    "latest_object_timestamp": "2026-07-15T09:57:00Z"
   }
 }
 ```
+
+The `*_latest_object_timestamps` fields hold the `LastModified` of the newest
+object under each prefix (ISO 8601, UTC) — useful for judging whether a prefix
+is still being written to or has gone stale.
 
 ## Identify terminated-instance orphans
 
@@ -196,12 +232,17 @@ the result:
     "ch-s3-2fc4173e-f657-4a3a-9b3c-0ff806cece7c/c678aa7f-c040-4c93-ad02-3639983b4372": 79025264,
     ...
   },
+  "prefix_latest_object_timestamps": {
+    "ch-s3-2fc4173e-f657-4a3a-9b3c-0ff806cece7c/c678aa7f-c040-4c93-ad02-3639983b4372": "2026-07-15T09:57:00Z",
+    ...
+  },
   "summary": {
     "total_unique_uuids": 183,
     "total_ch_s3_prefixes": 91,
     "total_full_paths": 183,
     "total_size_bytes": 25620595561,
-    "total_size_human": "23.86 GB"
+    "total_size_human": "23.86 GB",
+    "latest_object_timestamp": "2026-07-15T09:57:00Z"
   }
 }
 ```

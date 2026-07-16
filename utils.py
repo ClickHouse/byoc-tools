@@ -7,7 +7,8 @@ import sys
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
-from typing import Set, List
+from datetime import datetime, timezone
+from typing import Optional, Set, List, Tuple
 
 
 # UUID format used in BYOC ch-s3-{uuid} prefixes (8-4-4-4-12 hex digits).
@@ -132,19 +133,23 @@ def list_next_level_prefixes(s3_client, bucket_name: str, prefix: str) -> Set[st
     return next_level_prefixes
 
 
-def sum_sizes_in_prefix(s3_client, bucket_name: str, prefix: str) -> int:
+def sum_prefix_stats(
+    s3_client, bucket_name: str, prefix: str
+) -> Tuple[int, Optional[datetime]]:
     """
-    Sum object sizes (bytes) under a given prefix.
-    
+    Sum object sizes (bytes) and track the newest LastModified under a prefix.
+
     Args:
         s3_client: boto3 S3 client
         bucket_name: Name of the S3 bucket
         prefix: Prefix to sum sizes for (e.g., 'ch-s3-000/uuid/')
-    
+
     Returns:
-        Total size in bytes
+        Tuple of (total size in bytes, LastModified of the newest object,
+        or None if the prefix holds no objects)
     """
     total_size = 0
+    latest_modified: Optional[datetime] = None
     continuation_token = None
 
     while True:
@@ -155,9 +160,14 @@ def sum_sizes_in_prefix(s3_client, bucket_name: str, prefix: str) -> int:
 
             response = s3_client.list_objects_v2(**params)
 
-            # Accumulate sizes in this page
+            # Accumulate sizes and newest timestamp in this page
             for obj in response.get("Contents", []):
                 total_size += obj.get("Size", 0)
+                last_modified = obj.get("LastModified")
+                if last_modified and (
+                    latest_modified is None or last_modified > latest_modified
+                ):
+                    latest_modified = last_modified
 
             continuation_token = response.get("NextContinuationToken")
             if not continuation_token:
@@ -170,7 +180,22 @@ def sum_sizes_in_prefix(s3_client, bucket_name: str, prefix: str) -> int:
             print(f"Unexpected error counting {prefix}: {e}")
             break
 
-    return total_size
+    return total_size, latest_modified
+
+
+def format_timestamp(dt: Optional[datetime]) -> Optional[str]:
+    """
+    Format a datetime as an ISO 8601 UTC string (e.g. '2026-07-16T09:57:00Z').
+
+    Args:
+        dt: datetime to format (or None)
+
+    Returns:
+        ISO 8601 string, or None if dt is None
+    """
+    if dt is None:
+        return None
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def format_size(size_bytes: int) -> str:
