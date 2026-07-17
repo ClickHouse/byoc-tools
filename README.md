@@ -61,8 +61,8 @@ its throughput is bounded by network latency x concurrency instead — on a
 script (`-w 100`).
 
 ```shell
-$ cd go && go build -o list-top-level-prefixes .
-$ ./list-top-level-prefixes -w 200 -t 20 ${bucket}
+$ make build       # downloads Go deps + builds go/list-top-level-prefixes
+$ ./go/list-top-level-prefixes -w 200 -t 20 ${bucket}
 ```
 
 Flags: `-o` output file, `-w` concurrent requests (default 200), `-t` top-N
