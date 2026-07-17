@@ -32,13 +32,19 @@ def load_non_terminated_uuids(filename: str) -> Set[str]:
 
 
 def format_size(size_bytes: int) -> str:
-    """Return human-readable size: GB if 1G<=size<1T, TB if >=1T, else bytes."""
+    """Return human-readable size: TB/GB/MB/KB, or raw bytes below 1 KB."""
+    kb = 1024
+    mb = 1024**2
     gb = 1024**3
     tb = 1024**4
-    if gb <= size_bytes < tb:
-        return f"{size_bytes / gb:.2f} GB"
     if size_bytes >= tb:
         return f"{size_bytes / tb:.2f} TB"
+    if size_bytes >= gb:
+        return f"{size_bytes / gb:.2f} GB"
+    if size_bytes >= mb:
+        return f"{size_bytes / mb:.2f} MB"
+    if size_bytes >= kb:
+        return f"{size_bytes / kb:.2f} KB"
     return f"{size_bytes} bytes"
 
 
