@@ -1,2 +1,12 @@
 go/list-top-level-prefixes
 __pycache__/
+.venv/
+
+# tool outputs — may contain real account data, never commit
+data_prefixes.json
+backup_prefixes.json
+system_table_prefixes.json
+top_level_prefixes.json
+dirty_data_result.json
+dirty_backup_result.json
+non_terminated_*.list
