@@ -1,7 +1,2 @@
-.venv/
-data_prefixes.json
-result.json
-backup_prefixes.json
-dirty_backup_result.json
+go/list-top-level-prefixes
 __pycache__/
-non_terminated_prefixes.list
