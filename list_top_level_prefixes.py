@@ -9,14 +9,24 @@ prefixes exist (ch-s3-000/, ch-s3-{uuid}/, bare instance-uuid UDF dirs,
 metrics/, ...) and sums each subtree. Objects sitting directly at the bucket
 root (no folder) are reported under the pseudo-entry "(bucket root)".
 
-Note: this is a full ListObjectsV2 walk of the bucket. It is exact and
-real-time, but on very large buckets (hundreds of TB / billions of objects)
-it can take hours — prefer CloudWatch BucketSizeBytes or S3 Inventory there.
+Parallelism model: a single ListObjectsV2 pagination is inherently serial
+(each page needs the previous page's continuation token), so scanning one
+folder per worker degenerates to single-threaded whenever one folder holds
+most of the bucket. To avoid that, folders are recursively split into their
+subfolders (Delimiter='/') down to --split-depth levels below the bucket
+root; only at that depth does a worker fall back to a flat pagination of the
+remaining subtree. Each split level costs one extra LIST request per
+directory node but lets every subtree scan proceed in parallel.
+
+Note: this is still a full walk of the bucket. It is exact and real-time,
+but on very large buckets (hundreds of TB / billions of objects) it can take
+a long time — prefer CloudWatch BucketSizeBytes or S3 Inventory there.
 """
 
 import argparse
 import concurrent.futures
 import json
+import sys
 import time
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
@@ -33,85 +43,145 @@ from utils import (
 ROOT_OBJECTS_KEY = "(bucket root)"
 
 
-def list_root_folders_and_objects(
-    s3_client, bucket_name: str
+def list_with_delimiter(
+    s3_client, bucket_name: str, prefix: str
 ) -> Tuple[List[str], int, Optional[datetime]]:
     """
-    List the bucket root with Delimiter='/'.
+    List one directory level (Delimiter='/') under a prefix.
 
-    Returns (sorted first-level folder names without trailing slash,
-    total size of objects sitting directly at the root,
-    newest LastModified among those root objects or None).
+    Returns (subfolder prefixes with trailing slash, total size of objects
+    directly at this level, newest LastModified among those objects or None).
     """
-    folders: List[str] = []
-    root_size = 0
-    root_latest: Optional[datetime] = None
+    subfolders: List[str] = []
+    direct_size = 0
+    direct_latest: Optional[datetime] = None
     continuation_token = None
 
     while True:
-        params = {"Bucket": bucket_name, "Delimiter": "/"}
+        params = {"Bucket": bucket_name, "Prefix": prefix, "Delimiter": "/"}
         if continuation_token:
             params["ContinuationToken"] = continuation_token
 
         response = s3_client.list_objects_v2(**params)
 
         for common_prefix in response.get("CommonPrefixes", []):
-            folders.append(common_prefix["Prefix"].rstrip("/"))
+            subfolders.append(common_prefix["Prefix"])
 
         for obj in response.get("Contents", []):
-            root_size += obj.get("Size", 0)
+            direct_size += obj.get("Size", 0)
             last_modified = obj.get("LastModified")
             if last_modified and (
-                root_latest is None or last_modified > root_latest
+                direct_latest is None or last_modified > direct_latest
             ):
-                root_latest = last_modified
+                direct_latest = last_modified
 
         continuation_token = response.get("NextContinuationToken")
         if not continuation_token:
             break
 
-    return sorted(folders), root_size, root_latest
+    return subfolders, direct_size, direct_latest
+
+
+def scan_task(
+    s3_client,
+    bucket_name: str,
+    top_folder: str,
+    prefix: str,
+    level: int,
+    split_depth: int,
+) -> Tuple[str, int, Optional[datetime], List[Tuple[str, int]]]:
+    """
+    Scan one unit of work.
+
+    Below split_depth: list a single directory level, return its direct
+    objects' stats and the subfolders as new (prefix, level) work units.
+    At split_depth: flat-paginate the whole remaining subtree.
+
+    Returns (top_folder, size, latest, child_units).
+    """
+    try:
+        if level < split_depth:
+            subfolders, size, latest = list_with_delimiter(
+                s3_client, bucket_name, prefix
+            )
+            return top_folder, size, latest, [(sub, level + 1) for sub in subfolders]
+        size, latest = sum_prefix_stats(s3_client, bucket_name, prefix)
+        return top_folder, size, latest, []
+    except Exception as e:
+        print(f"\nError scanning {prefix}: {e}")
+        return top_folder, 0, None, []
 
 
 def collect_top_level_prefixes(
-    bucket_name: str, output_file: str, max_workers: int, top: int
+    bucket_name: str,
+    output_file: str,
+    max_workers: int,
+    top: int,
+    split_depth: int,
 ):
-    print(f"Using {max_workers} concurrent workers")
+    print(f"Using {max_workers} concurrent workers, split depth {split_depth}")
 
     s3_client = create_s3_client(max_workers)
 
     start_time = time.perf_counter()
 
     print(f"Listing first-level folders in bucket: {bucket_name}")
-    folders, root_size, root_latest = list_root_folders_and_objects(
-        s3_client, bucket_name
+    folders_with_slash, root_size, root_latest = list_with_delimiter(
+        s3_client, bucket_name, ""
     )
+    folders = sorted(f.rstrip("/") for f in folders_with_slash)
     print(f"Found {len(folders)} first-level folder(s)")
 
-    folder_to_size: Dict[str, int] = {}
-    folder_to_latest: Dict[str, Optional[datetime]] = {}
+    folder_to_size: Dict[str, int] = {folder: 0 for folder in folders}
+    folder_to_latest: Dict[str, Optional[datetime]] = {
+        folder: None for folder in folders
+    }
 
-    def stats_for_folder(folder: str) -> Tuple[str, int, Optional[datetime]]:
-        try:
-            total_size, latest_modified = sum_prefix_stats(
-                s3_client, bucket_name, f"{folder}/"
-            )
-            return (folder, total_size, latest_modified)
-        except Exception as e:
-            print(f"Error counting objects for {folder}: {e}")
-            return (folder, 0, None)
+    # Work units are (top_folder, prefix, level); directories below
+    # split_depth fan out into one unit per subfolder so a single huge
+    # folder can't serialize the scan. Aggregation happens only in this
+    # thread, so no locking is needed.
+    completed_units = 0
+    total_units = len(folders)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(stats_for_folder, f): f for f in folders}
+        futures = {
+            executor.submit(
+                scan_task, s3_client, bucket_name, folder, f"{folder}/", 1, split_depth
+            )
+            for folder in folders
+        }
 
-        completed_count = 0
-        total_count = len(folders)
-        for future in concurrent.futures.as_completed(futures):
-            folder, total_size, latest_modified = future.result()
-            folder_to_size[folder] = total_size
-            folder_to_latest[folder] = latest_modified
-            completed_count += 1
-            print_progress("Counting sizes", completed_count, total_count)
+        while futures:
+            done, futures = concurrent.futures.wait(
+                futures, return_when=concurrent.futures.FIRST_COMPLETED
+            )
+            for future in done:
+                top_folder, size, latest, child_units = future.result()
+                folder_to_size[top_folder] += size
+                if latest and (
+                    folder_to_latest[top_folder] is None
+                    or latest > folder_to_latest[top_folder]
+                ):
+                    folder_to_latest[top_folder] = latest
+
+                for child_prefix, child_level in child_units:
+                    futures.add(
+                        executor.submit(
+                            scan_task,
+                            s3_client,
+                            bucket_name,
+                            top_folder,
+                            child_prefix,
+                            child_level,
+                            split_depth,
+                        )
+                    )
+                total_units += len(child_units)
+                completed_units += 1
+            print_progress("Scanning units", completed_units, total_units)
+
+    sys.stdout.write("\n")
 
     if root_size or root_latest:
         folder_to_size[ROOT_OBJECTS_KEY] = root_size
@@ -195,10 +265,28 @@ def main():
         default=20,
         help="How many largest folders to print to stdout (default: 20)",
     )
+    parser.add_argument(
+        "-d",
+        "--split-depth",
+        type=int,
+        default=3,
+        help=(
+            "Directory depth (levels below the bucket root) down to which "
+            "folders are split into parallel subfolder scans; deeper "
+            "subtrees are flat-paginated. Raise it if one deep folder "
+            "dominates the runtime; lower it to reduce LIST request count. "
+            "(default: 3)"
+        ),
+    )
 
     args = parser.parse_args()
 
-    collect_top_level_prefixes(args.bucket_name, args.output, args.workers, args.top)
+    if args.split_depth < 1:
+        parser.error("--split-depth must be >= 1")
+
+    collect_top_level_prefixes(
+        args.bucket_name, args.output, args.workers, args.top, args.split_depth
+    )
 
 
 if __name__ == "__main__":
