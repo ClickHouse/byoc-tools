@@ -12,11 +12,13 @@ root (no folder) are reported under the pseudo-entry "(bucket root)".
 Parallelism model: a single ListObjectsV2 pagination is inherently serial
 (each page needs the previous page's continuation token), so scanning one
 folder per worker degenerates to single-threaded whenever one folder holds
-most of the bucket. To avoid that, folders are recursively split into their
-subfolders (Delimiter='/') down to --split-depth levels below the bucket
-root; only at that depth does a worker fall back to a flat pagination of the
-remaining subtree. Each split level costs one extra LIST request per
-directory node but lets every subtree scan proceed in parallel.
+most of the bucket. Splitting is therefore adaptive: each work unit starts
+as a flat pagination, and only when it exceeds --split-pages pages is it
+abandoned and re-listed one directory level at a time (Delimiter='/'),
+fanning its subfolders out as new parallel units — recursively, until every
+unit fits the budget. Small folders cost exactly one LIST request (no
+split overhead); only genuinely large subtrees pay the extra split requests
+that buy them parallelism.
 
 Note: this is still a full walk of the bucket. It is exact and real-time,
 but on very large buckets (hundreds of TB / billions of objects) it can take
@@ -33,7 +35,6 @@ from typing import Dict, List, Optional, Tuple
 
 from utils import (
     create_s3_client,
-    sum_prefix_stats,
     format_size,
     format_timestamp,
     print_progress,
@@ -87,26 +88,52 @@ def scan_task(
     bucket_name: str,
     top_folder: str,
     prefix: str,
-    level: int,
-    split_depth: int,
-) -> Tuple[str, int, Optional[datetime], List[Tuple[str, int]]]:
+    split_pages: int,
+) -> Tuple[str, int, Optional[datetime], List[str]]:
     """
-    Scan one unit of work.
+    Scan one unit of work, splitting adaptively.
 
-    Below split_depth: list a single directory level, return its direct
-    objects' stats and the subfolders as new (prefix, level) work units.
-    At split_depth: flat-paginate the whole remaining subtree.
+    Start with a flat pagination of the subtree. If it finishes within
+    split_pages pages, done. Otherwise the subtree is too big to scan
+    serially: abandon the partial flat scan (its counts are discarded) and
+    re-list this prefix one directory level deep (Delimiter='/') instead,
+    returning the direct objects' stats plus the subfolders as new work
+    units. A prefix whose objects all sit at one level has no subfolders to
+    fan out, so the delimiter listing itself completes the count.
 
-    Returns (top_folder, size, latest, child_units).
+    Returns (top_folder, size, latest, child_unit_prefixes).
     """
     try:
-        if level < split_depth:
-            subfolders, size, latest = list_with_delimiter(
-                s3_client, bucket_name, prefix
-            )
-            return top_folder, size, latest, [(sub, level + 1) for sub in subfolders]
-        size, latest = sum_prefix_stats(s3_client, bucket_name, prefix)
-        return top_folder, size, latest, []
+        size = 0
+        latest: Optional[datetime] = None
+        pages = 0
+        continuation_token = None
+
+        while True:
+            params = {"Bucket": bucket_name, "Prefix": prefix}
+            if continuation_token:
+                params["ContinuationToken"] = continuation_token
+
+            response = s3_client.list_objects_v2(**params)
+            pages += 1
+
+            for obj in response.get("Contents", []):
+                size += obj.get("Size", 0)
+                last_modified = obj.get("LastModified")
+                if last_modified and (latest is None or last_modified > latest):
+                    latest = last_modified
+
+            continuation_token = response.get("NextContinuationToken")
+            if not continuation_token:
+                return top_folder, size, latest, []
+            if pages >= split_pages:
+                break
+
+        # Too big for one serial scan — split into subfolders instead.
+        subfolders, direct_size, direct_latest = list_with_delimiter(
+            s3_client, bucket_name, prefix
+        )
+        return top_folder, direct_size, direct_latest, subfolders
     except Exception as e:
         print(f"\nError scanning {prefix}: {e}")
         return top_folder, 0, None, []
@@ -117,9 +144,12 @@ def collect_top_level_prefixes(
     output_file: str,
     max_workers: int,
     top: int,
-    split_depth: int,
+    split_pages: int,
 ):
-    print(f"Using {max_workers} concurrent workers, split depth {split_depth}")
+    print(
+        f"Using {max_workers} concurrent workers, "
+        f"splitting folders larger than {split_pages} list pages"
+    )
 
     s3_client = create_s3_client(max_workers)
 
@@ -137,17 +167,17 @@ def collect_top_level_prefixes(
         folder: None for folder in folders
     }
 
-    # Work units are (top_folder, prefix, level); directories below
-    # split_depth fan out into one unit per subfolder so a single huge
-    # folder can't serialize the scan. Aggregation happens only in this
-    # thread, so no locking is needed.
+    # Work units are subtree prefixes; a unit that exceeds the page budget
+    # fans out into one unit per subfolder, so a single huge folder can't
+    # serialize the scan while small folders stay a single request each.
+    # Aggregation happens only in this thread, so no locking is needed.
     completed_units = 0
     total_units = len(folders)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
             executor.submit(
-                scan_task, s3_client, bucket_name, folder, f"{folder}/", 1, split_depth
+                scan_task, s3_client, bucket_name, folder, f"{folder}/", split_pages
             )
             for folder in folders
         }
@@ -165,7 +195,7 @@ def collect_top_level_prefixes(
                 ):
                     folder_to_latest[top_folder] = latest
 
-                for child_prefix, child_level in child_units:
+                for child_prefix in child_units:
                     futures.add(
                         executor.submit(
                             scan_task,
@@ -173,8 +203,7 @@ def collect_top_level_prefixes(
                             bucket_name,
                             top_folder,
                             child_prefix,
-                            child_level,
-                            split_depth,
+                            split_pages,
                         )
                     )
                 total_units += len(child_units)
@@ -266,26 +295,26 @@ def main():
         help="How many largest folders to print to stdout (default: 20)",
     )
     parser.add_argument(
-        "-d",
-        "--split-depth",
+        "-s",
+        "--split-pages",
         type=int,
-        default=3,
+        default=20,
         help=(
-            "Directory depth (levels below the bucket root) down to which "
-            "folders are split into parallel subfolder scans; deeper "
-            "subtrees are flat-paginated. Raise it if one deep folder "
-            "dominates the runtime; lower it to reduce LIST request count. "
-            "(default: 3)"
+            "Page budget (1000 objects per page) above which a subtree is "
+            "split into parallel per-subfolder scans instead of one serial "
+            "pagination. Lower = more parallelism (and more LIST requests) "
+            "on large folders; small folders always cost one request. "
+            "(default: 20)"
         ),
     )
 
     args = parser.parse_args()
 
-    if args.split_depth < 1:
-        parser.error("--split-depth must be >= 1")
+    if args.split_pages < 1:
+        parser.error("--split-pages must be >= 1")
 
     collect_top_level_prefixes(
-        args.bucket_name, args.output, args.workers, args.top, args.split_depth
+        args.bucket_name, args.output, args.workers, args.top, args.split_pages
     )
 
 
