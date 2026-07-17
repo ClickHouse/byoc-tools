@@ -51,6 +51,32 @@ the result:
 > hours — prefer CloudWatch `BucketSizeBytes` for the total, or S3 Inventory +
 > Athena for per-prefix breakdowns at that scale.
 
+## Go implementation (~10x faster)
+
+Python's per-request CPU overhead caps a single process at a few hundred
+LIST requests/s regardless of thread count. The Go implementation in `go/`
+uses the same adaptive-split model and produces shape-compatible JSON, but
+its throughput is bounded by network latency x concurrency instead — on a
+~110 GB / 4k-folder test bucket it finished in 52s vs 533s for the Python
+script (`-w 100`).
+
+```shell
+$ cd go && go build -o list-top-level-prefixes .
+$ ./list-top-level-prefixes -w 200 -t 20 ${bucket}
+```
+
+Flags: `-o` output file, `-w` concurrent requests (default 200), `-t` top-N
+printout (default 20), `-s` split page budget (default 20), `-region` AWS
+region override. Prefer this one for buckets beyond a few GB.
+
+### Picking a tool by bucket size
+
+| Bucket | Tool |
+|---|---|
+| ≤ a few GB | either script |
+| GB ~ a few TB | Go implementation |
+| Hundreds of TB+ / billions of objects | CloudWatch `BucketSizeBytes` (total) or S3 Inventory + Athena (per-prefix) — full walks stop being practical |
+
 # Get the dirty data prefixes
 
 *data bucket pattern:*
