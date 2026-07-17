@@ -39,17 +39,19 @@ def load_non_terminated_uuids(filename: str) -> Set[str]:
     return uuids
 
 
-def load_backup_prefixes(filename: str) -> tuple[List[str], Dict[str, int]]:
+def load_backup_prefixes(
+    filename: str,
+) -> tuple[List[str], Dict[str, int], Dict[str, str]]:
     """
     Load backup prefixes list from JSON file.
-    Returns (prefixes_list, prefix_sizes_dict).
+    Returns (prefixes_list, prefix_sizes_dict, prefix_latest_timestamps_dict).
     Supports both old format (list) and new format (dict with 'prefixes' key).
 
     Args:
         filename: Path to backup_prefixes.json file
 
     Returns:
-        Tuple of (prefixes list, sizes dictionary)
+        Tuple of (prefixes list, sizes dictionary, latest timestamps dictionary)
     """
     with open(filename, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -58,10 +60,11 @@ def load_backup_prefixes(filename: str) -> tuple[List[str], Dict[str, int]]:
     if isinstance(data, dict) and "prefixes" in data:
         prefixes = data["prefixes"]
         sizes = data.get("prefix_sizes_bytes", {})
-        return prefixes, sizes
+        timestamps = data.get("prefix_latest_object_timestamps", {})
+        return prefixes, sizes, timestamps
     # Handle old format: just a list
     elif isinstance(data, list):
-        return data, {}
+        return data, {}, {}
     else:
         raise ValueError(f"Unexpected JSON format in {filename}")
 
@@ -141,7 +144,9 @@ def main():
     start_time = time.perf_counter()
 
     print(f"Loading backup prefixes from {args.backup_prefixes}...")
-    backup_prefixes, prefix_sizes = load_backup_prefixes(args.backup_prefixes)
+    backup_prefixes, prefix_sizes, prefix_timestamps = load_backup_prefixes(
+        args.backup_prefixes
+    )
     print(f"Loaded {len(backup_prefixes)} paths from {args.backup_prefixes}")
 
     print(f"Loading non-terminated next-level UUIDs from {args.non_terminated}...")
@@ -180,6 +185,19 @@ def main():
             "total_dirty_size_bytes": total_dirty_size,
             "total_dirty_size_human": format_size(total_dirty_size),
         }
+    if prefix_timestamps:
+        dirty_timestamps = {
+            path: prefix_timestamps.get(path) for path in sorted_dirty_paths
+        }
+        output_data["dirty_paths_latest_object_timestamps"] = dirty_timestamps
+        # ISO 8601 UTC strings compare chronologically, so plain max works
+        latest_dirty = max(
+            (ts for ts in dirty_timestamps.values() if ts is not None),
+            default=None,
+        )
+        output_data.setdefault("summary", {})[
+            "latest_dirty_object_timestamp"
+        ] = latest_dirty
 
     print(f"Saving results to {args.output}...")
     with open(args.output, "w", encoding="utf-8") as f:
