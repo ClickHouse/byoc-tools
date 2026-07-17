@@ -154,6 +154,8 @@ func (sc *scanner) scanUnit(ctx context.Context, topFolder, prefix string) {
 }
 
 func formatSize(sizeBytes int64) string {
+	const kb = 1 << 10
+	const mb = 1 << 20
 	const gb = 1 << 30
 	const tb = 1 << 40
 	switch {
@@ -161,6 +163,10 @@ func formatSize(sizeBytes int64) string {
 		return fmt.Sprintf("%.2f TB", float64(sizeBytes)/float64(tb))
 	case sizeBytes >= gb:
 		return fmt.Sprintf("%.2f GB", float64(sizeBytes)/float64(gb))
+	case sizeBytes >= mb:
+		return fmt.Sprintf("%.2f MB", float64(sizeBytes)/float64(mb))
+	case sizeBytes >= kb:
+		return fmt.Sprintf("%.2f KB", float64(sizeBytes)/float64(kb))
 	default:
 		return fmt.Sprintf("%d bytes", sizeBytes)
 	}
