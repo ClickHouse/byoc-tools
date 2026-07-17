@@ -1,5 +1,6 @@
 # byoc-tools
 
+* list top-level prefixes (bucket overview)
 * list data prefixes
 * list backup prefixes
 * list system-tables prefixes
@@ -12,6 +13,43 @@ $ pip install -r requirements.txt
 $ export AWS_PROFILE=XXX # switch to the correct profile
 $ aws s3 ls # make sure the command can return correctly
 ```
+
+# Bucket overview: size per first-level folder
+
+Layout-agnostic: sums every first-level folder in the bucket (hex shards,
+`ch-s3-{uuid}` dirs, UDF dirs, `metrics/`, ...) plus objects at the bucket
+root, and reports the whole-bucket total. Useful as the first command against
+an unfamiliar bucket, or to see which subtree dominates.
+
+```shell
+$ python list_top_level_prefixes.py ${bucket} -w 100 -t 20   # -t: how many largest folders to print
+```
+
+the result:
+
+```json
+{
+  "folders": {
+    "ch-s3-{KeyPrefix-uuid}": {
+      "total_bytes": 56983256576,
+      "total_size_human": "53.08 GB",
+      "latest_object_timestamp": "2026-07-15T09:57:00Z"
+    },
+    ...
+  },
+  "summary": {
+    "total_folders": 4110,
+    "bucket_total_size_bytes": 123806743839,
+    "bucket_total_size_human": "115.30 GB",
+    "latest_object_timestamp": "2026-07-15T09:57:00Z"
+  }
+}
+```
+
+> Note: this walks every object in the bucket (exact + real-time). On very
+> large buckets (hundreds of TB / billions of objects) a full walk can take
+> hours — prefer CloudWatch `BucketSizeBytes` for the total, or S3 Inventory +
+> Athena for per-prefix breakdowns at that scale.
 
 # Get the dirty data prefixes
 
