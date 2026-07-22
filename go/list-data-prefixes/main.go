@@ -48,6 +48,7 @@ type lister struct {
 	shardsDone atomic.Int64
 	pathsDone  atomic.Int64
 	pathsTotal atomic.Int64
+	errCount   atomic.Int64
 }
 
 // listShard delimiter-lists one ch-s3-xxx/ shard and fans each discovered
@@ -70,6 +71,7 @@ func (l *lister) listShard(ctx context.Context, shard string) {
 		<-l.sem
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "\nError processing %s: %v\n", shard, err)
+			l.errCount.Add(1)
 			return
 		}
 		for _, cp := range out.CommonPrefixes {
@@ -118,6 +120,7 @@ func (l *lister) scanPrefix(ctx context.Context, fullPath string) {
 		<-l.sem
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "\nError counting objects for %s: %v\n", fullPath, err)
+			l.errCount.Add(1)
 			return
 		}
 		for _, obj := range out.Contents {
@@ -216,6 +219,18 @@ func main() {
 		sem:           make(chan struct{}, *workers),
 		stats:         map[string]*prefixStat{},
 		shardPrefixes: map[string][]string{},
+	}
+
+	// Preflight: fail fast with one clear error (bad credentials, wrong
+	// region, missing bucket) instead of 4096 identical per-shard errors
+	// and a bogus empty output file.
+	if _, err := l.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket:  aws.String(bucket),
+		MaxKeys: aws.Int32(1),
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "cannot access bucket %s: %v\n", bucket, err)
+		fmt.Fprintln(os.Stderr, "hint: set AWS_PROFILE (e.g. AWS_PROFILE=BYOC_Test_Dev_Admin) and pass -region if the bucket is not in the profile's default region")
+		os.Exit(1)
 	}
 
 	const totalShards = 0x1000
@@ -337,4 +352,9 @@ func main() {
 	}
 
 	fmt.Printf("\nTotal elapsed time: %.2f seconds\n", time.Since(start).Seconds())
+
+	if n := l.errCount.Load(); n > 0 {
+		fmt.Fprintf(os.Stderr, "\n⚠️  %d scan errors — output is INCOMPLETE, do not feed it into deletion\n", n)
+		os.Exit(1)
+	}
 }

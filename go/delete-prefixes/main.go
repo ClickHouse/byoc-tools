@@ -333,6 +333,17 @@ func main() {
 		sem:     make(chan struct{}, *workers),
 		results: make(map[string]*prefixResult, len(dirtyPaths)),
 	}
+
+	// Preflight: fail fast with one clear error (bad credentials, wrong
+	// region, missing bucket) instead of one identical error per prefix.
+	if _, err := d.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket:  aws.String(bucket),
+		MaxKeys: aws.Int32(1),
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "cannot access bucket %s: %v\n", bucket, err)
+		fmt.Fprintln(os.Stderr, "hint: set AWS_PROFILE (e.g. AWS_PROFILE=BYOC_Test_Dev_Admin) and pass -region if the bucket is not in the profile's default region")
+		os.Exit(1)
+	}
 	for _, p := range dirtyPaths {
 		d.results[p] = &prefixResult{}
 	}
