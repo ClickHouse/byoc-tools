@@ -1,5 +1,6 @@
 GO_DIR := go
 GO_BIN := $(GO_DIR)/list-top-level-prefixes
+GO_DELETE_BIN := $(GO_DIR)/delete-prefixes/delete-prefixes
 
 .PHONY: all deps build python-deps fmt vet clean
 
@@ -9,10 +10,11 @@ all: build
 deps:
 	cd $(GO_DIR) && go mod download
 
-## Build the Go binary (downloads dependencies first)
+## Build the Go binaries (downloads dependencies first)
 build: deps
 	cd $(GO_DIR) && go build -o list-top-level-prefixes .
-	@echo "Built $(GO_BIN)"
+	cd $(GO_DIR) && go build -o delete-prefixes/delete-prefixes ./delete-prefixes
+	@echo "Built $(GO_BIN) and $(GO_DELETE_BIN)"
 
 ## Install Python dependencies for the scripts
 python-deps:
@@ -25,4 +27,4 @@ vet:
 	cd $(GO_DIR) && go vet ./...
 
 clean:
-	rm -f $(GO_BIN)
+	rm -f $(GO_BIN) $(GO_DELETE_BIN)

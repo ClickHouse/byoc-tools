@@ -1,4 +1,5 @@
 go/list-top-level-prefixes
+go/delete-prefixes/delete-prefixes
 __pycache__/
 .venv/
 
