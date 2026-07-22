@@ -91,6 +91,22 @@ run the command below to gain the prefixes:
 $ python list_data_prefixes.py ${data_bucket} -w 100 # e.g data_bucket: xxx.us-east-2.aws.clickhouse.cloud-shared
 ```
 
+### Go implementation (much faster)
+
+`go/list-data-prefixes/` is a Go port with the same output JSON shape
+(feeds straight into `get_final_dirty_data_prefix.py`). Shard discovery and
+per-prefix size scans are pipelined — each `ch-s3-xxx` shard's prefixes start
+their stats scans as soon as that shard's listing returns. On the dev test
+bucket (4096 shards, ~10k prefixes) it finishes in ~15s with `-w 200`.
+
+```shell
+$ make build       # builds go/list-data-prefixes/list-data-prefixes too
+$ ./go/list-data-prefixes/list-data-prefixes -w 200 -region us-west-2 ${data_bucket}
+```
+
+Flags: `-o` output file (default `data_prefixes.json`), `-w` concurrent S3
+requests (default 200), `-region` AWS region override.
+
 the result:
 
 ```json
