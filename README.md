@@ -61,8 +61,8 @@ its throughput is bounded by network latency x concurrency instead — on a
 script (`-w 100`).
 
 ```shell
-$ make build       # downloads Go deps + builds go/list-top-level-prefixes
-$ ./go/list-top-level-prefixes -w 200 -t 20 ${bucket}
+$ make build       # downloads Go deps + builds all binaries under go/
+$ ./go/list-top-level-prefixes/list-top-level-prefixes -w 200 -t 20 ${bucket}
 ```
 
 Flags: `-o` output file, `-w` concurrent requests (default 200), `-t` top-N
@@ -90,6 +90,22 @@ run the command below to gain the prefixes:
 ```shell
 $ python list_data_prefixes.py ${data_bucket} -w 100 # e.g data_bucket: xxx.us-east-2.aws.clickhouse.cloud-shared
 ```
+
+### Go implementation (much faster)
+
+`go/list-data-prefixes/` is a Go port with the same output JSON shape
+(feeds straight into `get_final_dirty_data_prefix.py`). Shard discovery and
+per-prefix size scans are pipelined — each `ch-s3-xxx` shard's prefixes start
+their stats scans as soon as that shard's listing returns. On the dev test
+bucket (4096 shards, ~10k prefixes) it finishes in ~15s with `-w 200`.
+
+```shell
+$ make build       # builds go/list-data-prefixes/list-data-prefixes too
+$ ./go/list-data-prefixes/list-data-prefixes -w 200 -region us-west-2 ${data_bucket}
+```
+
+Flags: `-o` output file (default `data_prefixes.json`), `-w` concurrent S3
+requests (default 200), `-region` AWS region override.
 
 the result:
 
@@ -422,6 +438,30 @@ Total elapsed time: 1234.56 seconds
 ```shell
 $ python delete_prefixes.py ${backup_bucket} -i dirty_backup_result.json -w 10
 ```
+
+## Go implementation (much faster)
+
+`go/delete-prefixes/` is a Go port of `delete_prefixes.py` built for throughput.
+It reads the same input JSON and writes the same log JSON shape, but pipelines
+listing and deleting: every LIST page (1000 keys) is dispatched to a concurrent
+`DeleteObjects` batch immediately instead of listing each prefix fully first,
+`DeleteObjects` runs in Quiet mode, and keys that fail inside a batch are
+retried with backoff. A single `-w` cap bounds total in-flight S3 requests
+(LIST + DELETE combined), so it can safely run at hundreds of concurrent
+requests where the Python script tops out at a few dozen threads.
+
+```shell
+$ make build       # builds go/delete-prefixes/delete-prefixes too
+$ ./go/delete-prefixes/delete-prefixes -i dirty_data_result.json --dry-run ${bucket}   # preview first
+$ ./go/delete-prefixes/delete-prefixes -i dirty_data_result.json -w 200 ${bucket}
+```
+
+Flags: `-i` input JSON (default `dirty_data_result.json`), `-w` concurrent S3
+requests (default 200), `-dry-run` preview only, `-o` optional result log JSON,
+`-yes` skip the confirmation prompt (for scripted runs), `-region` AWS region
+override. Same safety behavior as the Python script: summary + explicit `yes`
+confirmation before live deletion, per-prefix error reporting, non-zero exit
+if any prefix failed.
 
 ## Command-line options
 
