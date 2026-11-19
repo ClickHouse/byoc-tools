@@ -1,6 +1,6 @@
-go/list-top-level-prefixes/list-top-level-prefixes
-go/delete-prefixes/delete-prefixes
-go/list-data-prefixes/list-data-prefixes
+s3-cleanup/go/list-top-level-prefixes/list-top-level-prefixes
+s3-cleanup/go/delete-prefixes/delete-prefixes
+s3-cleanup/go/list-data-prefixes/list-data-prefixes
 __pycache__/
 .venv/
 
@@ -12,3 +12,6 @@ top_level_prefixes.json
 dirty_data_result.json
 dirty_backup_result.json
 non_terminated_*.list
+
+# kill switch state directories — hold your original IAM and cluster settings, never commit
+clickhouse-byoc-kill-switch-*/

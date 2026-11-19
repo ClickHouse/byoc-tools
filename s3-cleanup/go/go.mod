@@ -1,4 +1,4 @@
-module github.com/ClickHouse/byoc-tools/go
+module github.com/ClickHouse/byoc-tools/s3-cleanup/go
 
 go 1.26.1
 
